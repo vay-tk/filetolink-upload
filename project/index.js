@@ -1,63 +1,53 @@
 import TelegramBot from "node-telegram-bot-api";
-import axios from "axios";
+import dotenv from "dotenv";
 import fs from "fs";
-import https from "https";
-import "dotenv/config";
+import path from "path";
+import mime from "mime-types";
+import { uploadToGofile } from "./utils/gofileUpload.js";
 
-// Init bot
+dotenv.config();
+
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-const getUploadServer = async () => {
-  const res = await axios.get("https://api.gofile.io/getServer");
-  return res.data.data.server;
-};
+const TEMP_DIR = "./temp";
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
-const uploadToGofile = async (filePath) => {
-  const server = await getUploadServer();
-  const form = new FormData();
-  form.append("file", fs.createReadStream(filePath));
-
-  const res = await axios.post(`https://${server}.gofile.io/uploadFile`, form, {
-    headers: form.getHeaders(),
-  });
-
-  return res.data.data.downloadPage;
-};
-
-// Listen for any file
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
 
-  if (!msg.document && !msg.video && !msg.audio) {
-    return bot.sendMessage(chatId, "Send me a file, video, audio, or document.");
+  const file = msg.document || msg.video || msg.audio;
+  if (!file) {
+    return bot.sendMessage(chatId, "❌ Send me a video/audio/pdf/zip file to upload.");
   }
 
-  const file = msg.document || msg.video || msg.audio;
-
   const fileId = file.file_id;
-  const fileName = file.file_name || "file";
-  const fileExt = fileName.split(".").pop();
+  const fileName = file.file_name || `file_${Date.now()}`;
+  const mimeType = file.mime_type;
+  const ext = mime.extension(mimeType) || "bin";
+  const filePath = path.join(TEMP_DIR, `${fileName}.${ext}`);
 
   try {
+    bot.sendMessage(chatId, "📥 Downloading file from Telegram...");
     const fileLink = await bot.getFileLink(fileId);
 
-    const filePath = `./temp.${fileExt}`;
     const writer = fs.createWriteStream(filePath);
-    const response = await https.get(fileLink, (res) => res.pipe(writer));
+    const response = await fetch(fileLink);
+    if (!response.ok) throw new Error("Download error");
 
-    await new Promise((resolve) => writer.on("finish", resolve));
+    await new Promise((resolve, reject) => {
+      response.body.pipe(writer);
+      response.body.on("error", reject);
+      writer.on("finish", resolve);
+    });
 
-    const downloadLink = await uploadToGofile(filePath);
+    bot.sendMessage(chatId, "📤 Uploading to GoFile.io...");
+    const gofileLink = await uploadToGofile(filePath);
 
-    bot.sendMessage(
-      chatId,
-      `✅ File Uploaded!\n\nFile: *${fileName}*\nLink: ${downloadLink}`,
-      { parse_mode: "Markdown" }
-    );
-
-    fs.unlinkSync(filePath); // Cleanup
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(chatId, "❌ Error uploading file.");
+    await bot.sendMessage(chatId, `✅ File uploaded:\n\n🔗 ${gofileLink}`);
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, "❌ Error: " + err.message);
+  } finally {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }
 });
